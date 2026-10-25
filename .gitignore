@@ -1,0 +1,4 @@
+firmware/.pio/
+__pycache__/
+*.bin
+.DS_Store
