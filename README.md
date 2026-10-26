@@ -1,6 +1,6 @@
 # StackChan 木偶固件
 
-设备只执行指令、上报事件，所有逻辑都在 Mac 上（`host/stackchan_host.py`，pm2 名 `stackchan-host`，端口 5310）。
+设备只执行指令、上报事件，所有逻辑都在 Mac 上。用 `pm2 start ecosystem.config.js` 独立托管两个进程，不挂在 Claude 会话里：`stackchan-host`（`host/stackchan_host.py`，端口 5310）和 `stackchan-quota`（`scripts/cpa_quota_screen.py`，把额度画成卡片推到屏幕）。
 
 ```
 你的脚本/API ──HTTP──▶ stackchan-host ──USB 串口 / BLE──▶ StackChan
