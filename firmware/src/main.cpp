@@ -68,6 +68,12 @@ static uint8_t brightness = 128;
 static uint32_t sleepAfterMs = 180000;  // 0 = 永不熄屏
 static uint32_t lastActivityMs = 0;
 
+// 机身 12 颗 RGB LED: 主循环按时间切换, 不阻塞串口/触摸/舵机
+static bool ledReady = false, ledLit = false;
+static uint8_t ledR = 0, ledG = 0, ledB = 0;
+static uint32_t ledOnMs = 300, ledOffMs = 300, ledNextMs = 0;
+static int ledRemaining = 0;
+
 static SemaphoreHandle_t txMutex;
 static StreamBufferHandle_t bleRx;
 static NimBLECharacteristic* bleTx = nullptr;
@@ -170,6 +176,52 @@ static bool servoPowerOn() {
   return py32Read(0x05, &rb) && (rb & 0x01);
 }
 
+// 协议与官方 StackChan-BSP 一致: pin13 输出, 12 颗 RGB565 LED 从 0x30 开始
+static bool ledShow(uint8_t r, uint8_t g, uint8_t b) {
+  uint16_t color = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3);
+  uint8_t data[24];
+  for (int i = 0; i < 12; i++) {
+    data[i * 2] = color & 0xFF;
+    data[i * 2 + 1] = color >> 8;
+  }
+  return M5.In_I2C.writeRegister(PY32_ADDR, 0x30, data, sizeof(data), PY32_FREQ) &&
+         py32SetBit(0x24, 6, true);
+}
+
+static bool ledInit() {
+  if (!py32SetBit(0x04, 5, true) ||   // pin13: 输出
+      !py32SetBit(0x0C, 5, false) ||  // 关下拉
+      !py32SetBit(0x0A, 5, true) ||   // 开上拉
+      !py32SetBit(0x14, 5, false)) return false;  // 推挽
+  uint8_t cfg = 0;
+  if (!py32Read(0x24, &cfg) ||
+      !M5.In_I2C.writeRegister8(PY32_ADDR, 0x24, (cfg & 0xC0) | 12, PY32_FREQ)) return false;
+  return ledShow(0, 0, 0);
+}
+
+static void pollLed() {
+  if (!ledReady || !ledRemaining || (int32_t)(millis() - ledNextMs) < 0) return;
+  bool ok;
+  if (ledLit) {
+    ok = ledShow(0, 0, 0);
+    ledLit = false;
+    if (ok && --ledRemaining == 0) {
+      sendSimpleEvent("led_done");
+      return;
+    }
+    ledNextMs = millis() + ledOffMs;
+  } else {
+    ok = ledShow(ledR, ledG, ledB);
+    ledLit = true;
+    ledNextMs = millis() + ledOnMs;
+  }
+  if (!ok) {
+    ledRemaining = 0;
+    ledLit = false;
+    sendSimpleEvent("error", "msg", "led i2c");
+  }
+}
+
 // 初始化序列照搬 M5Stack 官方 StackChan 固件 (hal/drivers/Si12T), 只清 SLEEP 是不会出触摸数据的
 static void touchInit() {
   uint8_t ctrl = 0;
@@ -266,6 +318,17 @@ static void nuzzle() {
                    {(int16_t)(y - 8), (int16_t)(p + 4), 250},
                    {(int16_t)y, (int16_t)p, 300}};
   headSubmit(s, 3);
+}
+
+static void touchNuzzle() {
+  static uint32_t lastAt = 0;
+  static bool reacted = false;
+  uint32_t now = millis();
+  // 跨区抚摸立即反应, 连续抚摸时每 3 秒最多蹭一次
+  if (reacted && now - lastAt < 3000) return;
+  reacted = true;
+  lastAt = now;
+  nuzzle();
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +464,8 @@ static void handleJson(const uint8_t* p, size_t len) {
     r["fw"] = FW_VERSION;
     r["servo"] = servoReady;
     r["touch"] = touchReady;
+    r["led"] = ledReady;
+    r["sleep_sec"] = sleepAfterMs / 1000;
     r["id"] = doc["id"];
     sendEvent(r);
   } else if (!strcmp(cmd, "head")) {
@@ -438,6 +503,29 @@ static void handleJson(const uint8_t* p, size_t len) {
   } else if (!strcmp(cmd, "screen")) {
     if (doc["on"] | true) activity();
     else setScreen(false);
+  } else if (!strcmp(cmd, "led")) {
+    if (!ledReady) {
+      sendSimpleEvent("error", "msg", "led unavailable");
+    } else {
+      ledRemaining = 0;
+      ledLit = false;
+      if (!(doc["on"] | true)) {
+        if (!ledShow(0, 0, 0)) sendSimpleEvent("error", "msg", "led i2c");
+      } else {
+        ledR = constrain(doc["rgb"][0] | 255, 0, 255);
+        ledG = constrain(doc["rgb"][1] | 255, 0, 255);
+        ledB = constrain(doc["rgb"][2] | 255, 0, 255);
+        ledOnMs = constrain(doc["on_ms"] | 300, 20, 60000);
+        ledOffMs = constrain(doc["off_ms"] | 300, 20, 60000);
+        if (!ledShow(ledR, ledG, ledB)) {
+          sendSimpleEvent("error", "msg", "led i2c");
+        } else {
+          ledLit = true;
+          ledRemaining = constrain(doc["flashes"] | 1, 1, 1000);
+          ledNextMs = millis() + ledOnMs;
+        }
+      }
+    }
   } else if (!strcmp(cmd, "i2c_read")) {
     // 调试用: 读内部 I2C 上任意芯片的一段寄存器, 不用重刷固件就能摸索新芯片
     uint8_t addr = doc["addr"] | 0, reg = doc["reg"] | 0, n = constrain(doc["n"] | 1, 1, 64);
@@ -463,6 +551,11 @@ static void handleJson(const uint8_t* p, size_t len) {
   } else if (!strcmp(cmd, "config")) {
     if (doc["auto_react"].is<bool>()) autoReact = doc["auto_react"];
     if (doc["sleep_sec"].is<int>()) sleepAfterMs = (uint32_t)max(0, doc["sleep_sec"].as<int>()) * 1000;
+    JsonDocument r;
+    r["evt"] = "config";
+    r["sleep_sec"] = sleepAfterMs / 1000;
+    r["auto_react"] = autoReact;
+    sendEvent(r);
   } else {
     sendSimpleEvent("error", "msg", "unknown cmd");
   }
@@ -658,7 +751,7 @@ static void pollTouch() {
   static constexpr uint32_t RELEASE_MS = 200;
   static uint32_t lastPoll = 0, downAt = 0, lastSeenAt = 0;
   static uint8_t firstZone = 0, lastZone = 0, seenZones = 0;
-  static bool down = false, holdSent = false;
+  static bool down = false, holdSent = false, petSent = false;
   if (!touchReady || millis() - lastPoll < 50) return;
   lastPoll = millis();
 
@@ -673,15 +766,19 @@ static void pollTouch() {
       down = true;
       downAt = now;
       holdSent = false;
+      petSent = false;
       firstZone = z;
       seenZones = z;
       activity();
-      if (autoReact) {
-        nuzzle();
-        if (!showingImage) avatar.setExpression(Expression::Happy);
-      }
+      if (autoReact && !showingImage) avatar.setExpression(Expression::Happy);
     } else {
+      uint8_t newZones = z & ~seenZones;
       seenZones |= z;
+      // 摸头要有跨触摸区的位移; 点按和原地长按不触发舵机动作
+      if (autoReact && !petSent && newZones) {
+        petSent = true;
+        touchNuzzle();
+      }
       if (!holdSent && now - downAt > 1000 && seenZones != 0x7) {
         holdSent = true;
         sendSimpleEvent("touch", "type", "hold");
@@ -766,6 +863,7 @@ void setup() {
     servoReady = true;
     servoMove(0, 45, 600);
   }
+  ledReady = ledInit();
   touchInit();
   frameQueue = xQueueCreate(8, sizeof(Frame));
   xTaskCreatePinnedToCore(serialRxTask, "serial_rx", 4096, nullptr, 5, nullptr, PRO_CPU_NUM);
@@ -777,6 +875,8 @@ void setup() {
   JsonDocument hello;
   hello["evt"] = "hello";
   hello["fw"] = FW_VERSION;
+  hello["led"] = ledReady;
+  hello["sleep_sec"] = sleepAfterMs / 1000;
   if (hangMagic == HANG_MAGIC) {
     hello["last_hang"] = (const char*)hangInfo;
     hangMagic = 0;
@@ -801,6 +901,8 @@ void loop() {
   updateMouth();
   loopStage = "avatar";
   drawAvatar();
+  loopStage = "led";
+  pollLed();
   loopStage = "screen_sleep";
   checkScreenSleep();
 }

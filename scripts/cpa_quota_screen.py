@@ -6,7 +6,9 @@
 
 数据与 Claude Code 状态栏同源: ~/.claude/cliproxy-quota.json, 由 cliproxy-quota.ts 采集。
 剩余% = 100 - used, 与状态栏一致; 数据过期(stale)的 provider 名字后标 ~。
-在屏幕上向左划看下一个 provider, 向右划看上一个; 双击屏幕立即刷新额度。
+每个 provider 的账户按每页最多 3 个分页, 账户过多时自动续页。
+在屏幕上向左划看下一页, 向右划看上一页; 双击屏幕只重新采集当前 provider。
+后台每 30 分钟仍全量刷新, 各 provider 分别记录最近一次单页刷新时间。
 
 环境变量:
   QUOTA_INTERVAL_MIN  数据刷新间隔, 默认 30
@@ -37,22 +39,27 @@ def log(*a):
     print(time.strftime("%m-%d %H:%M:%S"), *a, flush=True)
 
 
-def cache_age():
+def cache_age(provider=None):
     try:
         with open(CACHE) as f:
-            return time.time() - json.load(f).get("updated_at", 0)
-    except (OSError, ValueError):
+            data = json.load(f)
+        updated_at = (data.get("provider_updated_at") or {}).get(provider, data.get("updated_at", 0)) \
+            if provider else data.get("updated_at", 0)
+        return time.time() - updated_at
+    except (OSError, ValueError, TypeError):
         return float("inf")
 
 
-def refresh_cache(force=False):
-    if not force and cache_age() < CACHE_TTL:
+def refresh_cache(force=False, provider=None):
+    if not force and cache_age(provider) < CACHE_TTL:
         return
     bun = os.path.expanduser("~/.bun/bin/bun")
     env = {k: v for k, v in os.environ.items() if "proxy" not in k.lower()}
+    cmd = [bun, "--no-env-file", "--use-system-ca", COLLECTOR]
+    if provider:
+        cmd += ["--provider", provider]
     try:
-        subprocess.run([bun, "--no-env-file", "--use-system-ca", COLLECTOR], env=env,
-                       capture_output=True, timeout=60, check=True)
+        subprocess.run(cmd, env=env, capture_output=True, timeout=60, check=True)
     except Exception as e:
         log(f"采集失败, 用旧缓存: {e}")
 
@@ -63,16 +70,17 @@ PROVIDERS = [("codex", "gpt"), ("claude", "cc"), ("antigravity", "gem"), ("xai",
 
 def load_pages():
     """返回 [(provider 名, 是否过期, [(账户名, [(窗口, 剩余%, 重置时间戳)])]), ...], 以及数据更新时间。
-    多个 CPA 实例的同一 provider 合并到一页。"""
+    同一账户出现在多个 CPA 实例时按邮箱去重; 数据不一致时保留剩余更少的值。"""
     with open(CACHE) as f:
         data = json.load(f)
     pages = []
+    provider_times = data.get("provider_updated_at") or {}
     for key, label in PROVIDERS:
-        accounts, stale = [], False
-        for inst in (data.get("instances") or {}).values():
+        accounts, stale = {}, False
+        for inst_name, inst in (data.get("instances") or {}).items():
             quota = (inst or {}).get(key) or {}
             stale = stale or bool(quota.get("stale"))
-            for acc in quota.get("accounts") or []:
+            for acc_index, acc in enumerate(quota.get("accounts") or []):
                 if key == "xai":  # grok 只有周额度, 字段直接平铺在账户上
                     raw = [{"seconds": 604800, "used": acc.get("used"), "reset_at": acc.get("reset_at")}]
                 else:
@@ -83,10 +91,21 @@ def load_pages():
                         continue
                     wl = "wk" if key == "xai" else WINDOW_LABEL.get(w.get("seconds"), f"{(w.get('seconds') or 0) // 3600}h")
                     wins.append((wl, max(0, round(100 - w["used"])), w.get("reset_at")))
-                if wins:
-                    accounts.append(((acc.get("email") or "?").split("@")[0][:12], wins))
-        if accounts:
-            pages.append((label, stale, accounts))
+                if not wins:
+                    continue
+                email = acc.get("email")
+                identity = email.casefold() if email else (inst_name, acc_index)
+                name, merged = accounts.setdefault(identity, (email or "?", {}))
+                for wl, left, reset_at in wins:
+                    previous = merged.get(wl)
+                    if previous is None or left < previous[0]:
+                        merged[wl] = (left, reset_at)
+        rows = [((name.split("@")[0])[:12], [(wl, *values) for wl, values in wins.items()])
+                for name, wins in accounts.values()]
+        if rows:
+            updated_at = provider_times.get(key, data.get("updated_at", 0))
+            for start in range(0, len(rows), 3):
+                pages.append((label, stale, rows[start:start + 3], updated_at))
     return pages, data.get("updated_at", 0)
 
 
@@ -102,8 +121,8 @@ def color(left):
     return (240, 110, 110) if left <= 10 else (240, 210, 100) if left <= 30 else (120, 210, 140)
 
 
-def render(provider, page, pages, updated_at, refreshing=False) -> str:
-    label, stale, accounts = provider
+def render(provider, page, pages, refreshing=False) -> str:
+    label, stale, accounts, updated_at = provider
     img = Image.new("RGB", (320, 240), (18, 18, 24))
     d = ImageDraw.Draw(img)
     f_title, f_name, f_pct, f_small = (ImageFont.truetype(FONT, s) for s in (24, 16, 20, 13))
@@ -164,6 +183,7 @@ DOUBLE_TAP_SEC = 0.5
 flip = 0                     # 待处理的翻页步数, 左划 +1 右划 -1
 flip_lock = threading.Lock()
 refresh_req = threading.Event()
+redraw_req = threading.Event()  # 设备重连后固件已回到表情脸, 强制重推当前页
 wake = threading.Event()     # 有操作时立刻处理, 不等下次数据刷新
 
 
@@ -172,26 +192,34 @@ def listen_screen():
     last_tap = 0.0
     while True:
         try:
-            for line in _opener.open(f"{STACKCHAN}/events", timeout=60):
-                if not line.startswith(b"data: "):
-                    continue
-                evt = json.loads(line[6:])
-                if evt.get("evt") != "screen":
-                    continue
-                if evt.get("type") == "tap":
-                    now = time.time()
-                    if now - last_tap < DOUBLE_TAP_SEC:
-                        last_tap = 0.0
-                        refresh_req.set()
+            with _opener.open(f"{STACKCHAN}/events", timeout=60) as stream:
+                # 也可能错过设备未连 host 时发出的 hello, 所以事件流恢复本身就触发重画
+                redraw_req.set()
+                wake.set()
+                for line in stream:
+                    if not line.startswith(b"data: "):
+                        continue
+                    evt = json.loads(line[6:])
+                    if evt.get("evt") == "hello" or (evt.get("evt") == "link" and evt.get("via")):
+                        redraw_req.set()
                         wake.set()
-                    else:
-                        last_tap = now
-                    continue
-                step = {"swipe_left": 1, "swipe_right": -1}.get(evt.get("type"))
-                if step:
-                    with flip_lock:
-                        flip += step
-                    wake.set()
+                        continue
+                    if evt.get("evt") != "screen":
+                        continue
+                    if evt.get("type") == "tap":
+                        now = time.time()
+                        if now - last_tap < DOUBLE_TAP_SEC:
+                            last_tap = 0.0
+                            refresh_req.set()
+                            wake.set()
+                        else:
+                            last_tap = now
+                        continue
+                    step = {"swipe_left": 1, "swipe_right": -1}.get(evt.get("type"))
+                    if step:
+                        with flip_lock:
+                            flip += step
+                        wake.set()
         except Exception as e:
             log(f"事件流断开, 5 秒后重连: {e}")
             time.sleep(5)
@@ -200,34 +228,39 @@ def listen_screen():
 def main():
     global flip
     threading.Thread(target=listen_screen, daemon=True).start()
-    pages, updated_at, next_refresh = [], 0, 0
+    pages, next_refresh = [], 0
     page, shown = 0, None
     while True:
         wake.clear()
         try:
+            redraw = redraw_req.is_set()
+            if redraw:
+                redraw_req.clear()
+                shown = None
             forced = refresh_req.is_set()
+            current_provider = next(key for key, label in PROVIDERS if label == pages[page][0]) if pages else None
             if forced and pages:  # 先给个"刷新中"的反馈, 采集要几秒
-                show(render(pages[page], page, len(pages), updated_at, refreshing=True), wake=True)
+                show(render(pages[page], page, len(pages), refreshing=True), wake=True)
             if forced or time.time() >= next_refresh:
                 refresh_req.clear()
-                refresh_cache(force=forced)
-                pages, updated_at = load_pages()
+                refresh_cache(force=forced, provider=current_provider if forced else None)
+                pages, _ = load_pages()
                 next_refresh = time.time() + INTERVAL
                 shown = None  # 数据变了, 强制重画
-                log(("双击刷新: " if forced else "数据已刷新: ") + (", ".join(
+                log((f"双击刷新 {current_provider}: " if forced else "数据已刷新: ") + (", ".join(
                     f"{p[0]}({len(p[2])}个账户)" for p in pages) or "无数据"))
             with flip_lock:
                 step, flip = flip, 0
-            user_action = forced or step != 0
+            user_action = forced or step != 0 or redraw
             if not pages:
                 if shown != "empty":
                     show(render_empty(), wake=user_action)
                     shown = "empty"
             else:
                 page = (page + step) % len(pages)
-                key = (page, updated_at)
+                key = (page, pages[page][3])
                 if shown != key:
-                    show(render(pages[page], page, len(pages), updated_at), wake=user_action)
+                    show(render(pages[page], page, len(pages)), wake=user_action)
                     shown = key
         except Exception as e:
             log(f"失败: {e}")

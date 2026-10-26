@@ -19,6 +19,8 @@
   POST /bubble   {"text": "..."}                                       表情脸上的气泡文字
   POST /volume   {"v": 0~255}      POST /brightness {"v": 0~255}
   POST /config   {"auto_react": false, "sleep_sec": 180}               关掉被摸时的本地反应 / 无操作多久熄屏(0=不熄)
+  POST /led      {"rgb": [255, 180, 0], "on_ms": 250, "off_ms": 250, "flashes": 16}
+                 机身 RGB 灯有限次闪动; {"on": false} 立即关闭
   POST /cmd      {...}                                                 原样透传 JSON 指令
   GET  /status                     GET /events  (SSE 事件流)
 
@@ -64,6 +66,9 @@ ESPRESSIF_VID = 0x303A
 
 T_JSON, T_JPEG, T_AUDIO, T_JPEG_QUIET = 1, 2, 3, 4
 AUDIO_RATE = 16000
+DEFAULT_SLEEP_SEC = 180
+HEAD_TRIPLE_TAP_SEC = 3.0
+HEAD_CONFIG_TIMEOUT_SEC = 5.0
 
 GESTURES = {
     "nod": [[0, 55, 250], [0, 35, 250], [0, 55, 250], [0, 35, 250], [0, 45, 300]],
@@ -287,6 +292,11 @@ class Hub:
         self.send_lock = threading.Lock()
         self.clear_timer = None
         self.device_info = {}
+        self.sleep_sec = None
+        self.head_taps = deque()
+        self.touch_lock = threading.Lock()
+        self.auto_sleep_pending = False
+        self.auto_sleep_started = 0.0
         self.usb = SerialLink(self)
         self.ble = BleLink(self) if BLE_ENABLED else None
 
@@ -300,6 +310,11 @@ class Hub:
 
     def on_link_change(self):
         link = self.link
+        with self.touch_lock:
+            self.head_taps.clear()
+            self.auto_sleep_pending = False
+            self.auto_sleep_started = 0.0
+            self.sleep_sec = None
         if link:
             threading.Thread(target=self._safe_send_json, args=({"cmd": "ping"},), daemon=True).start()
         self.publish({"evt": "link", "via": link.name if link else None})
@@ -310,6 +325,55 @@ class Hub:
             self.send_json(cmd)
         except Exception as e:
             log(f"ping 失败: {e}")
+
+    def _sync_sleep_state(self, evt):
+        if evt.get("evt") not in ("hello", "pong", "config"):
+            return
+        value = evt.get("sleep_sec")
+        if not isinstance(value, (int, float)) or isinstance(value, bool):
+            return
+        with self.touch_lock:
+            feedback = evt.get("evt") == "config" and self.auto_sleep_pending
+            self.sleep_sec = max(0, int(value))
+            self.auto_sleep_pending = False
+            self.auto_sleep_started = 0.0
+        if feedback:
+            # 三击成功只闪灯: 绿色=不自动熄屏, 蓝色=恢复自动熄屏; 不切屏/不摆头
+            rgb = [0, 255, 0] if self.sleep_sec == 0 else [0, 0, 255]
+            try:
+                self.send_json({"cmd": "led", "rgb": rgb, "on_ms": 300, "off_ms": 200, "flashes": 2})
+            except Exception as e:
+                log(f"三击灯效提示失败: {e}")
+
+    def _on_head_touch(self, evt):
+        with self.touch_lock:
+            now = time.monotonic()
+            if self.auto_sleep_pending and now - self.auto_sleep_started > HEAD_CONFIG_TIMEOUT_SEC:
+                self.auto_sleep_pending = False
+                self.auto_sleep_started = 0.0
+                self.sleep_sec = None
+                threading.Thread(target=self._safe_send_json, args=({"cmd": "ping"},), daemon=True).start()
+            if evt.get("type") != "tap":
+                self.head_taps.clear()
+                return
+            if self.head_taps and now - self.head_taps[0] > HEAD_TRIPLE_TAP_SEC:
+                self.head_taps.clear()
+            self.head_taps.append(now)
+            if len(self.head_taps) < 3:
+                return
+            self.head_taps.clear()
+            if self.sleep_sec is None or self.auto_sleep_pending:
+                return
+            target = 0 if self.sleep_sec else DEFAULT_SLEEP_SEC
+            self.auto_sleep_pending = True
+            self.auto_sleep_started = now
+        try:
+            self.send_json({"cmd": "config", "sleep_sec": target})
+        except Exception as e:
+            with self.touch_lock:
+                self.auto_sleep_pending = False
+                self.auto_sleep_started = 0.0
+            log(f"三击切换自动熄屏失败: {e}")
 
     # ---- 下行 ----
     def _send(self, ftype, payload):
@@ -350,7 +414,10 @@ class Hub:
             return
         if evt.get("evt") in ("pong", "hello"):
             self.device_info = evt
+        self._sync_sleep_state(evt)
         self.publish(evt)
+        if evt.get("evt") == "touch":
+            self._on_head_touch(evt)
 
     def publish(self, evt: dict):
         evt = {**evt, "ts": time.time()}
@@ -481,7 +548,7 @@ def handle_post(path: str, body: dict):
         return {"via": hub.send_json({"cmd": "text", "text": body.get("text", "")})}
     simple = {"/head": "head", "/seq": "seq", "/face": "face", "/clear": "clear",
               "/volume": "volume", "/brightness": "brightness", "/config": "config", "/stop": "stop",
-              "/screen": "screen"}
+              "/screen": "screen", "/led": "led"}
     if path in simple:
         return {"via": hub.send_json({**body, "cmd": simple[path]})}
     if path == "/cmd":
@@ -505,6 +572,7 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/status":
             link = hub.link
             return self._json(200, {"connected": link is not None, "via": link.name if link else None,
+                                    "sleep_sec": hub.sleep_sec,
                                     "device": hub.device_info, "recent_events": list(hub.events)[-10:]})
         if self.path == "/events":
             return self._sse()
